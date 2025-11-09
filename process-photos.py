@@ -1,5 +1,6 @@
 import json
-from datetime import datetime
+import subprocess
+from datetime import datetime, timezone, timedelta
 from PIL import Image, ImageDraw, ImageOps, ExifTags
 import logging
 from pathlib import Path
@@ -9,6 +10,16 @@ import time
 import shutil
 from iptcinfo3 import IPTCInfo
 
+# Try to import zoneinfo for proper timezone handling (Python 3.9+)
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    # Fallback for Python < 3.9
+    try:
+        from backports.zoneinfo import ZoneInfo
+    except ImportError:
+        ZoneInfo = None
+
 # ANSI escape codes for text styling
 STYLING = {
     "GREEN": "\033[92m",
@@ -17,6 +28,10 @@ STYLING = {
     "BOLD": "\033[1m",
     "RESET": "\033[0m",
 }
+
+# Centralized accept/deny strings for menu logic
+accept_input_string = 'y'
+deny_input_string = 'n'
 
 #Setup log styling
 class ColorFormatter(logging.Formatter):
@@ -55,10 +70,11 @@ primary_images = []
 secondary_images = []
 
 # Define paths using pathlib
-photo_folder = Path('Photos/post/')
-bereal_folder = Path('Photos/bereal')
-output_folder = Path('Photos/post/__processed')
-output_folder_combined = Path('Photos/post/__combined')
+data_folder = 'resources/data'
+photo_folder = Path(data_folder + '/Photos/post/')
+bereal_folder = Path(data_folder + '/Photos/bereal')
+output_folder = Path('out/__processed')
+output_folder_combined = Path('out/__combined')
 output_folder.mkdir(parents=True, exist_ok=True)  # Create the output folder if it doesn't exist
 
 # Print the paths
@@ -91,26 +107,26 @@ print("Default settings are:\n"
 "1. Copied images are converted from WebP to JPEG\n"
 "2. Converted images' filenames do not contain the original filename\n"
 "3. Combined images are created on top of converted, singular images")
-advanced_settings = input("\nEnter " + STYLING["BOLD"] + "'yes'" + STYLING["RESET"] + "for advanced settings or press any key to continue with default settings: ").strip().lower()
+advanced_settings = input("\nEnter " + STYLING["BOLD"] + f"'{accept_input_string}'" + STYLING["RESET"] + "for advanced settings or press any key to continue with default settings: ").strip().lower()
 
-if advanced_settings != 'yes':
+if advanced_settings != accept_input_string:
     print("Continuing with default settings.\n")
 
 ## Default responses
-convert_to_jpeg = 'yes'
-keep_original_filename = 'no'
-create_combined_images = 'yes'
+convert_to_jpeg = accept_input_string
+keep_original_filename = deny_input_string
+create_combined_images = accept_input_string
 
 ## Proceed with advanced settings if chosen
-if advanced_settings == 'yes':
+if advanced_settings == accept_input_string:
     # User choice for converting to JPEG
     convert_to_jpeg = None
-    while convert_to_jpeg not in ['yes', 'no']:
-        convert_to_jpeg = input(STYLING["BOLD"] + "\n1. Do you want to convert images from WebP to JPEG? (yes/no): " + STYLING["RESET"]).strip().lower()
-        if convert_to_jpeg == 'no':
+    while convert_to_jpeg not in [accept_input_string, deny_input_string]:
+        convert_to_jpeg = input(STYLING["BOLD"] + f"\n1. Do you want to convert images from WebP to JPEG? ({accept_input_string}/{deny_input_string}): " + STYLING["RESET"]).strip().lower()
+        if convert_to_jpeg == deny_input_string:
             print("Your images will not be converted. No additional metadata will be added.")
-        if convert_to_jpeg not in ['yes', 'no']:
-            logging.error("Invalid input. Please enter 'yes' or 'no'.")
+        if convert_to_jpeg not in [accept_input_string, deny_input_string]:
+            logging.error(f"Invalid input. Please enter '{accept_input_string}' or '{deny_input_string}'.")
 
     # User choice for keeping original filename
     print(STYLING["BOLD"] + "\n2. There are two options for how output files can be named" + STYLING["RESET"] + "\n"
@@ -118,19 +134,19 @@ if advanced_settings == 'yes':
     "Option 2: YYYY-MM-DDTHH-MM-SS_primary/secondary.jpeg\n"
     "This will only influence the naming scheme of singular images.")
     keep_original_filename = None
-    while keep_original_filename not in ['yes', 'no']:
-        keep_original_filename = input(STYLING["BOLD"] + "Do you want to keep the original filename in the renamed file? (yes/no): " + STYLING["RESET"]).strip().lower()
-        if keep_original_filename not in ['yes', 'no']:
-            logging.error("Invalid input. Please enter 'yes' or 'no'.")
+    while keep_original_filename not in [accept_input_string, deny_input_string]:
+        keep_original_filename = input(STYLING["BOLD"] + f"Do you want to keep the original filename in the renamed file? ({accept_input_string}/{deny_input_string}): " + STYLING["RESET"]).strip().lower()
+        if keep_original_filename not in [accept_input_string, deny_input_string]:
+            logging.error(f"Invalid input. Please enter '{accept_input_string}' or '{deny_input_string}'.")
 
     # User choice for creating combined images
     create_combined_images = None
-    while create_combined_images not in ['yes', 'no']:
-        create_combined_images = input(STYLING["BOLD"] + "\n3. Do you want to create combined images like the original BeReal memories? (yes/no): " + STYLING["RESET"]).strip().lower()
-        if create_combined_images not in ['yes', 'no']:
-            logging.error("Invalid input. Please enter 'yes' or 'no'.")
+    while create_combined_images not in [accept_input_string, deny_input_string]:
+        create_combined_images = input(STYLING["BOLD"] + f"\n3. Do you want to create combined images like the original BeReal memories? ({accept_input_string}/{deny_input_string}): " + STYLING["RESET"]).strip().lower()
+        if create_combined_images not in [accept_input_string, deny_input_string]:
+            logging.error(f"Invalid input. Please enter '{accept_input_string}' or '{deny_input_string}'.")
 
-if convert_to_jpeg == 'no' and create_combined_images == 'no':
+if convert_to_jpeg == deny_input_string and create_combined_images == deny_input_string:
     print("You chose not to convert images nor do you want to output combined images.\n"
     "The script will therefore only copy images to a new folder and rename them according to your choice without adding metadata or creating new files.\n"
     "Script will continue to run in 5 seconds.")
@@ -150,6 +166,52 @@ def convert_webp_to_jpg(image_path):
             return None, False
     else:
         return image_path, False
+
+# Helper function to convert UTC datetime to German local time (CET/CEST)
+# Since EXIF doesn't support timezones, we adjust the time value manually
+def _utc_to_german_time(dt_utc):
+    """
+    Convert UTC datetime to German local time (CET/CEST).
+    Returns a naive datetime with the German local time value.
+    CET (winter): UTC+1
+    CEST (summer): UTC+2
+    """
+    if ZoneInfo is not None:
+        # Use zoneinfo for accurate DST handling
+        german_tz = ZoneInfo("Europe/Berlin")
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        dt_german = dt_utc.astimezone(german_tz)
+        # Return naive datetime with German local time value
+        return dt_german.replace(tzinfo=None)
+    else:
+        # Fallback: Manual calculation based on DST rules
+        # DST in Germany: Last Sunday in March at 2:00 AM to last Sunday in October at 3:00 AM
+        dt_naive = dt_utc.replace(tzinfo=None) if dt_utc.tzinfo else dt_utc
+        year = dt_naive.year
+        
+        # Find last Sunday in March (DST starts at 2:00 AM UTC, which is 3:00 AM CET)
+        march_last = datetime(year, 3, 31)
+        while march_last.weekday() != 6:  # 6 = Sunday
+            march_last -= timedelta(days=1)
+        # DST starts at 2:00 AM UTC on last Sunday of March
+        dst_start = march_last.replace(hour=2, minute=0, second=0, microsecond=0)
+        
+        # Find last Sunday in October (DST ends at 3:00 AM CEST, which is 1:00 AM UTC)
+        october_last = datetime(year, 10, 31)
+        while october_last.weekday() != 6:  # 6 = Sunday
+            october_last -= timedelta(days=1)
+        # DST ends at 1:00 AM UTC on last Sunday of October
+        dst_end = october_last.replace(hour=1, minute=0, second=0, microsecond=0)
+        
+        # Determine if we're in DST (summer time)
+        is_dst = dst_start <= dt_naive < dst_end
+        
+        # Add offset: +2 hours for summer (CEST), +1 hour for winter (CET)
+        offset_hours = 2 if is_dst else 1
+        dt_german = dt_naive + timedelta(hours=offset_hours)
+        
+        return dt_german
 
 # Helper function to convert latitude and longitude to EXIF-friendly format
 def _convert_to_degrees(value):
@@ -179,10 +241,20 @@ def update_exif(image_path, datetime_original, location=None, caption=None):
         # For debugging: Load and log the updated EXIF data
         #logging.info(f"Original EXIF data for {image_path}: {exif_dict}")
 
-        # Update datetime original
-        exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = datetime_original.strftime("%Y:%m:%d %H:%M:%S")
-        datetime_print = datetime_original.strftime("%Y:%m:%d %H:%M:%S")
-        logging.info(f"Found datetime: {datetime_print}")
+        # Update datetime original - convert UTC to German local time
+        # EXIF DateTimeOriginal doesn't support timezone, so we store German local time value
+        if datetime_original.tzinfo is not None:
+            # Convert to UTC if timezone-aware
+            datetime_utc = datetime_original.astimezone(timezone.utc)
+        else:
+            # If naive, assume it's already UTC and make it timezone-aware
+            datetime_utc = datetime_original.replace(tzinfo=timezone.utc)
+        
+        # Convert UTC to German local time (CET/CEST) for EXIF
+        datetime_german = _utc_to_german_time(datetime_utc)
+        datetime_str = datetime_german.strftime("%Y:%m:%d %H:%M:%S")
+        exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = datetime_str
+        logging.info(f"Found datetime (UTC): {datetime_utc.strftime('%Y:%m:%d %H:%M:%S')}, converted to German time: {datetime_str}")
         logging.info(f"Added capture date and time.")
 
         # Update GPS information if location is provided
@@ -241,6 +313,51 @@ def update_iptc(image_path, caption):
     except Exception as e:
         logging.error(f"Failed to update IPTC Caption-Abstract for {image_path}: {e}")
 
+
+# Functions to update MP4 metadata using ffmpeg
+def _format_iso6709_location(latitude, longitude):
+    """Return ISO 6709 string like +37.785834-122.406417/ used by QuickTime."""
+    lat_sign = '+' if latitude >= 0 else '-'
+    lon_sign = '+' if longitude >= 0 else '-'
+    # Use up to 6 decimal places which is common for GPS
+    return f"{lat_sign}{abs(latitude):.6f}{lon_sign}{abs(longitude):.6f}/"
+
+
+def update_mp4_metadata(input_path, output_path, datetime_original, location=None):
+    try:
+        # Ensure we use UTC time for MP4 metadata
+        if datetime_original.tzinfo is not None:
+            # Convert to UTC if timezone-aware
+            datetime_utc = datetime_original.astimezone(timezone.utc)
+        else:
+            # If naive, assume it's already UTC
+            datetime_utc = datetime_original
+        
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-i', str(input_path),
+            '-c', 'copy',
+            '-movflags', 'use_metadata_tags',
+            '-metadata', f"creation_time={datetime_utc.strftime('%Y-%m-%dT%H:%M:%S')}Z",
+        ]
+        if location and 'latitude' in location and 'longitude' in location:
+            iso6709 = _format_iso6709_location(location['latitude'], location['longitude'])
+            ffmpeg_cmd += ['-metadata', f"location={iso6709}"]
+
+        ffmpeg_cmd.append(str(output_path))
+
+        result = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            logging.error(f"Failed to update MP4 metadata for {input_path}: {result.stderr.decode(errors='ignore')}")
+            return False
+        logging.info(f"Updated MP4 metadata for {output_path}.")
+        return True
+    except FileNotFoundError:
+        logging.error("ffmpeg not found. Please install ffmpeg to write video metadata.")
+        return False
+    except Exception as e:
+        logging.error(f"Unexpected error updating MP4 metadata for {input_path}: {e}")
+        return False
 
 # Function to handle deduplication
 def get_unique_filename(path):
@@ -319,7 +436,7 @@ def remove_backup_files(directory):
 
 # Load the JSON file
 try:
-    with open('posts.json', encoding="utf8") as f:
+    with open(data_folder + '/posts.json', encoding="utf8") as f:
         data = json.load(f)
 except FileNotFoundError:
     logging.error("JSON file not found. Please check the path.")
@@ -339,7 +456,9 @@ for entry in data:
             primary_path = bereal_folder / primary_filename
             secondary_path = bereal_folder / secondary_filename
 
-        taken_at = datetime.strptime(entry['takenAt'], "%Y-%m-%dT%H:%M:%S.%fZ")
+        # Parse datetime as UTC-aware (the 'Z' suffix indicates UTC)
+        taken_at_naive = datetime.strptime(entry['takenAt'], "%Y-%m-%dT%H:%M:%S.%fZ")
+        taken_at = taken_at_naive.replace(tzinfo=timezone.utc)
         location = entry.get('location')  # This will be None if 'location' is not present
         caption = entry.get('caption')  # This will be None if 'caption' is not present
 
@@ -347,7 +466,7 @@ for entry in data:
         for path, role in [(primary_path, 'primary'), (secondary_path, 'secondary')]:
             logging.info(f"Found image: {path}")
             # Check if conversion to JPEG is enabled by the user
-            if convert_to_jpeg == 'yes':
+            if convert_to_jpeg == accept_input_string:
                 # Convert WebP to JPEG if necessary
                 converted_path, converted = convert_webp_to_jpg(path)
                 if converted_path is None:
@@ -360,13 +479,13 @@ for entry in data:
             time_str = taken_at.strftime("%Y-%m-%dT%H-%M-%S")  # ISO standard format with '-' instead of ':' for time
             original_filename_without_extension = Path(path).stem  # Extract original filename without extension
             
-            if convert_to_jpeg == 'yes':
-                if keep_original_filename == 'yes':
+            if convert_to_jpeg == accept_input_string:
+                if keep_original_filename == accept_input_string:
                     new_filename = f"{time_str}_{role}_{converted_path.name}"
                 else:
                     new_filename = f"{time_str}_{role}.jpg"
             else:
-                if keep_original_filename == 'yes':
+                if keep_original_filename == accept_input_string:
                     new_filename = f"{time_str}_{role}_{original_filename_without_extension}.webp"
                 else:
                     new_filename = f"{time_str}_{role}.webp"
@@ -374,17 +493,17 @@ for entry in data:
             new_path = output_folder / new_filename
             new_path = get_unique_filename(new_path)  # Ensure the filename is unique
             
-            if convert_to_jpeg == 'yes' and converted:
+            if convert_to_jpeg == accept_input_string and converted:
                 converted_path.rename(new_path)  # Move and rename the file
-
-                # Update EXIF and IPTC data
-                update_exif(new_path, taken_at, location, caption)                
-                logging.info(f"EXIF data added to converted image.")
-
-                image_path_str = str(new_path)
-                update_iptc(image_path_str, caption)
             else:
                 shutil.copy2(path, new_path) # Copy to new path
+
+            # Update EXIF and IPTC data for all images (converted or not)
+            update_exif(new_path, taken_at, location, caption)                
+            logging.info(f"EXIF data added to {role} image.")
+
+            image_path_str = str(new_path)
+            update_iptc(image_path_str, caption)
 
             if role == 'primary':
                 primary_images.append({
@@ -399,11 +518,42 @@ for entry in data:
             logging.info(f"Sucessfully processed {role} image.")
             processed_files_count += 1
             print("")
+
+        # Process BTS (behind-the-scenes) video if present
+        bts_media = entry.get('btsMedia')
+        if bts_media and isinstance(bts_media, dict) and bts_media.get('path'):
+            bts_filename = Path(bts_media['path']).name
+            bts_path = Path(data_folder) / bts_filename
+
+            if os.path.exists(bts_path) and bts_path.suffix.lower() == '.mp4':
+                time_str = taken_at.strftime("%Y-%m-%dT%H-%M-%S")
+                original_bts_stem = Path(bts_path).stem
+
+                if keep_original_filename == accept_input_string:
+                    bts_new_filename = f"{time_str}_bts_{original_bts_stem}.mp4"
+                else:
+                    bts_new_filename = f"{time_str}_bts.mp4"
+
+                bts_new_path = output_folder / bts_new_filename
+                bts_new_path = get_unique_filename(bts_new_path)
+
+                # Write metadata into MP4 while copying
+                temp_output = bts_new_path.with_suffix('.tmp.mp4')
+                success = update_mp4_metadata(bts_path, temp_output, taken_at, location)
+                if success:
+                    temp_output.replace(bts_new_path)
+                    logging.info(f"Successfully processed BTS video: {bts_new_path}")
+                    processed_files_count += 1
+                else:
+                    # Fallback: just copy without metadata
+                    shutil.copy2(bts_path, bts_new_path)
+                    logging.error(f"Copied BTS video without metadata: {bts_new_path}")
+                    processed_files_count += 1
     except Exception as e:
         logging.error(f"Error processing entry {entry}: {e}")
 
-# Create combined images if user chose 'yes'
-if create_combined_images == 'yes':
+# Create combined images if user chose accept
+if create_combined_images == accept_input_string:
     #Create output folder if it doesn't exist
     output_folder_combined.mkdir(parents=True, exist_ok=True)
 
@@ -433,7 +583,7 @@ if create_combined_images == 'yes':
         image_path_str = str(combined_image_path)
         update_iptc(image_path_str, primary_caption)
 
-        if convert_to_jpeg == 'yes':
+        if convert_to_jpeg == accept_input_string:
             # Convert WebP to JPEG if necessary
             converted_path, converted = convert_webp_to_jpg(combined_image_path)
             update_exif(converted_path, primary_taken_at, primary_location, primary_caption)
@@ -448,7 +598,7 @@ if create_combined_images == 'yes':
 # Clean up backup files
 print(STYLING['BOLD'] + "Removing backup files left behind by iptcinfo3" + STYLING["RESET"])
 remove_backup_files(output_folder)
-if create_combined_images == 'yes': remove_backup_files(output_folder_combined)
+if create_combined_images == accept_input_string: remove_backup_files(output_folder_combined)
 print("")
 
 # Summary
